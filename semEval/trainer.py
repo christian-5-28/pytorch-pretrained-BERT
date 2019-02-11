@@ -33,6 +33,9 @@ import torch.backends.cudnn as cudnn
 from pytorch_pretrained_bert.tokenization import BertTokenizer
 from pytorch_pretrained_bert.modeling import BertModel
 
+from wrapper_sentence_classifier import WrapperClassifier
+from wrapper_sentence_classifier import BertFeatExtractor
+
 logging.basicConfig(format = '%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
                     datefmt = '%m/%d/%Y %H:%M:%S',
                     level = logging.INFO)
@@ -188,6 +191,139 @@ def read_examples(input_file):
                 InputExample(unique_id=unique_id, text_a=text_a, text_b=text_b))
             unique_id += 1
     return examples
+
+
+class SemEvalTrainer:
+
+    def __init__(self, args):
+        self.args = args
+        self.initialize_run()
+
+    def initialize_run(self):
+
+        if torch.cuda.is_available():
+            if not self.args.cuda:
+                print("WARNING: You have a CUDA device, so you should probably run with --cuda")
+            else:
+                torch.cuda.set_device(self.args.gpu)
+                device = self.args.gpu
+                cudnn.benchmark = True
+                cudnn.enabled = True
+                # torch.cuda.manual_seed_all(args.evaluation_seed)
+        else:
+            print('CUDA NOT AVAILABLE!')
+            time.sleep(20)
+
+        layer_indexes = [int(x) for x in self.args.layers.split(",")]
+
+        # PREPARING TRAIN AND EVAL DATA #
+        self.tokenizer = BertTokenizer.from_pretrained(self.args.bert_model, do_lower_case=self.args.do_lower_case)
+
+        self.train_sentences, self.train_labels = self.read_examples(self.args.train_input_file)
+        self.train_features = self.convert_examples_to_features(
+            examples=self.train_sentences, seq_length=self.args.max_seq_length, tokenizer=self.tokenizer)
+
+        self.eval_sentences, self.eval_labels = self.read_examples(self.args.eval_input_file)
+        self.eval_features = self.convert_examples_to_features(
+            examples=self.eval_sentences, seq_length=self.args.max_seq_length, tokenizer=self.tokenizer)
+
+        # CREATING THE TRAIN AND EVAL DATA LOADERS
+        self.train_dataloader = self.create_data_loader(self.train_features, self.train_labels)
+        self.eval_dataloader = self.create_data_loader(self.eval_features, self.eval_labels)
+
+        print('data loaders ready...')
+
+        # INITIALIZING THE MODEL #
+        feat_extractor = BertFeatExtractor(args=self.args)
+
+        classifier_head = torch.nn.LSTM(input_size=self.args.input_size,
+                                        hidden_size=self.args.hidden_size,
+                                        batch_first=True,
+                                        bidirectional=self.args.bidirectional)
+
+        self.model = WrapperClassifier(feat_extractor=feat_extractor,
+                                       classifier_head=classifier_head,
+                                       freeze_feat_extract=True)
+
+        # gpu model handling
+        if self.args.cuda:
+            if self.args.single_gpu:
+                logger.info('USING SINGLE GPU!')
+                self.model = self.model.cuda()
+            else:
+                self.model = torch.nn.DataParallel(self.model, dim=1).cuda()
+
+        # initializing the optimizer
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.args.lr, weight_decay=self.args.wdecay)
+
+    def train(self):
+
+        ce_loss = torch.nn.CrossEntropyLoss()
+
+        start_time = time.time()
+        for epoch in range(self.args.epochs):
+
+            self.model.train()
+            tr_loss = 0
+            for batch_id, (input_ids, input_mask, example_indices, labels) in self.train_dataloader:
+                input_ids = input_ids.to(self.args.gpu)
+                input_mask = input_mask.to(self.args.gpu)
+
+                logits = self.model(input_ids=input_ids, token_type_ids=None, attention_mask=input_mask)
+
+                # loss = ce_loss(logits.view(-1, self.args.num_labels), labels.view(-1))
+                loss = ce_loss(logits, labels)
+                tr_loss += loss.item()
+
+                loss.backward()
+
+                self.optimizer.step()
+                self.optimizer.zero_grad()
+
+                if batch_id % self.args.log_interval == 0 and batch_id > 0:
+                    cur_loss = tr_loss / self.args.log_interval
+
+                    elapsed = time.time() - start_time
+
+                    logger.info('| epoch {:3d} | {:5d} batch | lr {:02.2f} | ms/batch {:5.2f} | '
+                                     'loss {:5.2f} '.format(
+                        epoch, batch_id, self.optimizer.param_groups[0]['lr'],
+                                      elapsed * 1000 / self.args.log_interval, cur_loss))
+
+                    tr_loss = 0
+                    start_time = time.time()
+
+            self.evaluate_model()
+
+
+
+
+
+    def create_data_loader(self, features, labels):
+        all_input_ids = torch.tensor([f.input_ids for f in features], dtype=torch.long)
+        all_input_mask = torch.tensor([f.input_mask for f in features], dtype=torch.long)
+        all_example_index = torch.arange(all_input_ids.size(0), dtype=torch.long)
+        all_labels = torch.tensor([lable for lable in labels], dtype=torch.long)
+
+        data = TensorDataset(all_input_ids,
+                             all_input_mask,
+                             all_example_index,
+                             all_labels
+                             )
+
+        if self.args.local_rank == -1:
+            sampler = SequentialSampler(data)
+        else:
+            sampler = DistributedSampler(data)
+
+        dataloader = DataLoader(data, sampler=sampler, batch_size=self.args.batch_size)
+
+        return dataloader
+
+
+
+
+
 
 
 def main():
