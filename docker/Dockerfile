@@ -2,6 +2,7 @@ FROM pytorch/pytorch:0.4.1-cuda9-cudnn7-devel
 
 RUN pip install pytorch-pretrained-bert
 RUN pip install emoji --upgrade
+RUN pip install TensorboardX
 
 RUN apt-get update && apt-get install screen
 
